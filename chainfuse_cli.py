@@ -119,6 +119,12 @@ class ChainEntry:
     non_protein: Dict[str, set[str]]
 
 
+@dataclass
+class StructureResult:
+    atoms: List[AtomRecord]
+    chain_map: Dict[str, List[ChainEntry]]
+
+
 def parse_atom_line(line: str) -> Optional[AtomRecord]:
     record = line[0:6].strip()
     if record not in {"ATOM", "HETATM"}:
@@ -268,8 +274,11 @@ def enumerate_chains(pdb_files: Sequence[str]) -> List[ChainEntry]:
     return chains
 
 
-def print_chain_summary(chains: Sequence[ChainEntry]) -> None:
-    print("Loaded chains:\n")
+def print_chain_table(title: str, chains: Sequence[ChainEntry]) -> None:
+    if not chains:
+        print(f"{title}: (no chains)\n")
+        return
+    print(f"{title}:\n")
     header = f"{'Idx':>4}  {'File':<25} {'Chain':<5} {'Residues':>9}  Name"
     print(header)
     print("-" * len(header))
@@ -278,6 +287,10 @@ def print_chain_summary(chains: Sequence[ChainEntry]) -> None:
             f"[{chain.master_index:>3}]  {chain.file_name:<25} {chain.chain_id:<5} {chain.residue_count:>9}  {chain.display_name}"
         )
     print()
+
+
+def print_chain_summary(chains: Sequence[ChainEntry]) -> None:
+    print_chain_table("Loaded chains", chains)
 
 
 def non_protein_report(chains: Sequence[ChainEntry]) -> bool:
@@ -403,10 +416,14 @@ def merge_chains(chains: Sequence[Sequence[AtomRecord]], target_chain_id: str) -
     return aggregated
 
 
-def assign_unique_chain_atoms(chains: Sequence[Sequence[AtomRecord]], generator: Iterator[str] | None = None) -> List[AtomRecord]:
+def assign_unique_chain_atoms(
+    chain_atoms: Sequence[Tuple[ChainEntry, Sequence[AtomRecord]]],
+    generator: Iterator[str] | None = None,
+) -> Tuple[List[AtomRecord], Dict[str, List[ChainEntry]]]:
     generator = generator or chain_id_stream()
     aggregated: List[AtomRecord] = []
-    for atoms in chains:
+    mapping: Dict[str, List[ChainEntry]] = {}
+    for chain, atoms in chain_atoms:
         if not atoms:
             continue
         try:
@@ -415,7 +432,8 @@ def assign_unique_chain_atoms(chains: Sequence[Sequence[AtomRecord]], generator:
             raise RuntimeError("Unable to assign additional chain labels.") from None
         remapped, _ = remap_chain_atoms(atoms, new_chain, start_res_seq=1)
         aggregated.extend(remapped)
-    return aggregated
+        mapping.setdefault(new_chain, []).append(chain)
+    return aggregated, mapping
 
 
 def format_atom_line(atom: AtomRecord, serial: int) -> str:
@@ -442,15 +460,39 @@ def write_pdb(path: Path, atoms: Sequence[AtomRecord]) -> None:
         handle.write("END\n")
 
 
+def log_structure_details(
+    label: str,
+    path: Path,
+    chains: Sequence[ChainEntry],
+    result: StructureResult,
+) -> None:
+    chain_ids = sorted({(atom.chain_id or "?")[:1] for atom in result.atoms})
+    chain_label = ", ".join(chain_ids) if chain_ids else "(none)"
+    print(f"{label}:")
+    print(f"  File: {path}")
+    print(f"  Output chain IDs: {chain_label}")
+    print(f"  Atom count: {len(result.atoms)}")
+    if result.chain_map:
+        print("  Chain lineage:")
+        for new_id in sorted(result.chain_map):
+            origins = ", ".join(
+                f"[{entry.master_index}] {entry.file_name} chain {entry.chain_id}"
+                for entry in result.chain_map[new_id]
+            )
+            print(f"    {new_id}: {origins}")
+    print()
+    print_chain_table(f"{label} source chains", chains)
+
+
 def build_component_structure(
     chains: Sequence[ChainEntry],
     *,
     merge: bool,
     merged_label: str,
     strip_non_protein: bool,
-) -> List[AtomRecord]:
+) -> StructureResult:
     if not chains:
-        return []
+        return StructureResult([], {})
     atom_groups = [filter_chain_atoms(chain, strip_non_protein) for chain in chains]
     if strip_non_protein:
         emptied = [chain for chain, atoms in zip(chains, atom_groups) if not atoms]
@@ -460,8 +502,14 @@ def build_component_structure(
                 f"Warning: chains {labels} contained no protein residues and will be skipped."
             )
     if merge:
-        return merge_chains(atom_groups, merged_label)
-    return assign_unique_chain_atoms(atom_groups)
+        atoms = merge_chains(atom_groups, merged_label)
+        mapping = {
+            merged_label: [chain for chain, atoms in zip(chains, atom_groups) if atoms],
+        }
+        return StructureResult(atoms, mapping)
+    paired = list(zip(chains, atom_groups))
+    atoms, mapping = assign_unique_chain_atoms(paired)
+    return StructureResult(atoms, mapping)
 
 
 def build_combined_structure(
@@ -469,19 +517,30 @@ def build_combined_structure(
     ligand: Sequence[ChainEntry],
     mode: str,
     strip_non_protein: bool,
-) -> List[AtomRecord]:
+) -> StructureResult:
     receptor_atoms = [filter_chain_atoms(chain, strip_non_protein) for chain in receptor]
     ligand_atoms = [filter_chain_atoms(chain, strip_non_protein) for chain in ligand]
     if mode == "paired":
         atoms: List[AtomRecord] = []
+        mapping: Dict[str, List[ChainEntry]] = {}
+        receptor_contrib = [chain for chain, atoms in zip(receptor, receptor_atoms) if atoms]
+        ligand_contrib = [chain for chain, atoms in zip(ligand, ligand_atoms) if atoms]
         atoms.extend(merge_chains(receptor_atoms, "A"))
         atoms.extend(merge_chains(ligand_atoms, "B"))
-        return atoms
+        if receptor_contrib:
+            mapping["A"] = receptor_contrib
+        if ligand_contrib:
+            mapping["B"] = ligand_contrib
+        return StructureResult(atoms, mapping)
     if mode == "renamed":
         generator = chain_id_stream()
-        atoms = assign_unique_chain_atoms(receptor_atoms, generator)
-        atoms.extend(assign_unique_chain_atoms(ligand_atoms, generator))
-        return atoms
+        receptor_pairs = list(zip(receptor, receptor_atoms))
+        ligand_pairs = list(zip(ligand, ligand_atoms))
+        atoms, mapping = assign_unique_chain_atoms(receptor_pairs, generator)
+        ligand_atoms_remapped, ligand_mapping = assign_unique_chain_atoms(ligand_pairs, generator)
+        atoms.extend(ligand_atoms_remapped)
+        mapping.update(ligand_mapping)
+        return StructureResult(atoms, mapping)
     raise ValueError(f"Unsupported combined mode: {mode}")
 
 
@@ -593,43 +652,52 @@ def main(argv: Sequence[str]) -> int:
     ligand_path = output_dir / "ligand.pdb"
     combined_path = output_dir / "complex.pdb"
 
-    receptor_atoms = build_component_structure(
+    receptor_result = build_component_structure(
         receptor_chains,
         merge=args.receptor_mode == "merge",
         merged_label="A",
         strip_non_protein=strip_non_protein,
     )
-    if not receptor_atoms:
+    if not receptor_result.atoms:
         raise ValueError("Receptor selection contains no protein atoms after filtering.")
-    ligand_atoms = build_component_structure(
+    ligand_result = build_component_structure(
         ligand_chains,
         merge=args.ligand_mode == "merge",
         merged_label="A",
         strip_non_protein=strip_non_protein,
     )
-    if not ligand_atoms:
+    if not ligand_result.atoms:
         raise ValueError("Ligand selection contains no protein atoms after filtering.")
-    combined_atoms = build_combined_structure(
+    combined_result = build_combined_structure(
         receptor_chains,
         ligand_chains,
         args.combined_mode,
         strip_non_protein,
     )
-    if not combined_atoms:
+    if not combined_result.atoms:
         raise ValueError("Combined structure contains no atoms after filtering selections.")
 
     ensure_output(receptor_path, args.overwrite)
     ensure_output(ligand_path, args.overwrite)
     ensure_output(combined_path, args.overwrite)
 
-    write_pdb(receptor_path, receptor_atoms)
-    write_pdb(ligand_path, ligand_atoms)
-    write_pdb(combined_path, combined_atoms)
+    write_pdb(receptor_path, receptor_result.atoms)
+    write_pdb(ligand_path, ligand_result.atoms)
+    write_pdb(combined_path, combined_result.atoms)
 
     print("Generated files:")
     print(f"  Receptor: {receptor_path}")
     print(f"  Ligand:   {ligand_path}")
     print(f"  Complex:  {combined_path}")
+    print()
+    log_structure_details("Receptor structure", receptor_path, receptor_chains, receptor_result)
+    log_structure_details("Ligand structure", ligand_path, ligand_chains, ligand_result)
+    log_structure_details(
+        "Complex structure",
+        combined_path,
+        [*receptor_chains, *ligand_chains],
+        combined_result,
+    )
     return 0
 
 
