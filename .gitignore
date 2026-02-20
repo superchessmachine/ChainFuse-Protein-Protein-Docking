@@ -1,0 +1,5 @@
+
+# data
+*.pdb
+__pycache__/
+*.pyc
