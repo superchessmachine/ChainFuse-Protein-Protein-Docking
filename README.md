@@ -18,7 +18,7 @@ arguments to be prompted for the PDB files interactively.
 ## Usage
 
 ```
-python chainfuse_cli.py Bre1-Lge1-helical-bundle.pdb EC-noDNARNA.pdb
+python chainfuse_cli.py structureA.pdb structureB.pdb
 ```
 
 When executed, the tool prints a table containing every detected chain across
